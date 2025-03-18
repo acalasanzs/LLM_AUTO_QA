@@ -6,7 +6,7 @@ import asyncio
 import aiohttp
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from queue import Queue
 from dotenv import load_dotenv
 import re
@@ -49,10 +49,8 @@ class OpenWebUIProcessor:
 
         # Set up model IDs from environment variables
         self.models = {
-            "small": os.getenv("small_MODEL_ID", "gemma-3-4b-it"),
-            "medium": os.getenv(
-                "medium_MODEL_ID", "mlx-community/mistral-nemo-instruct-2407"
-            ),
+            "small": os.getenv("small_MODEL_ID", "gemma-3-27b-it"),
+            "medium": os.getenv("medium_MODEL_ID", "gemma-3-27b-it"),
             "large": os.getenv(
                 "LARGE_MODEL_ID", "deepseek-r1-distill-qwen-32b-abliterated"
             ),
@@ -125,11 +123,12 @@ class OpenWebUIProcessor:
             logger.error(f"Async API request failed: {e}")
             raise
 
-    def clean_text(self, text: str) -> str:
+    async def clean_text_async(self, session: aiohttp.ClientSession, text: str) -> str:
         """
-        Clean text by removing UI elements using both model-based and regex-based approaches.
+        Asynchronously clean text by removing UI elements using both model-based and regex-based approaches.
 
         Args:
+            session: aiohttp client session
             text: Text to clean
 
         Returns:
@@ -184,14 +183,14 @@ class OpenWebUIProcessor:
                     },
                 ],
                 "temperature": 0.1,
-                "max_tokens": 4096,
+                "max_tokens": 5000,
             }
 
             # Attempt to use the small model for text cleaning
             try:
                 logger.info("Attempting to clean text with small model")
-                response = self._make_api_request(
-                    "chat/completions", clean_prompt, self.models["small"]
+                response = await self._make_async_api_request(
+                    session, "chat/completions", clean_prompt, self.models["small"]
                 )
                 model_cleaned_text = (
                     response.get("choices", [{}])[0]
@@ -217,12 +216,12 @@ class OpenWebUIProcessor:
 
         return cleaned_text
 
-    async def generate_qa_pairs(
+    async def generate_qa_pairs_with_parallel_cleaning(
         self, session: aiohttp.ClientSession, chunk: str, chunk_id: int
     ) -> Dict[str, Any]:
         """
-        Generate question-answer pairs for a chunk using the large model with web search enabled.
-        First cleans the chunk before processing.
+        Generate question-answer pairs for a chunk using the large model with web search enabled,
+        while cleaning the text in parallel.
 
         Args:
             session: aiohttp client session.
@@ -232,9 +231,17 @@ class OpenWebUIProcessor:
         Returns:
             Dictionary with processed chunk ID and generated JSONL data.
         """
-        # Clean the chunk AFTER chunking but BEFORE generating QA pairs
-        cleaned_chunk = self.clean_text(chunk)
-        logger.info(f"Cleaned chunk {chunk_id+1} before QA generation")
+        # Start cleaning the chunk in parallel
+        cleaning_task = asyncio.create_task(self.clean_text_async(session, chunk))
+
+        # Start preparing for QA generation (we'll use the cleaned text when it's ready)
+        logger.info(f"Started parallel cleaning for chunk {chunk_id+1}")
+
+        # Wait for cleaning to complete
+        cleaned_chunk = await cleaning_task
+        logger.info(
+            f"Completed cleaning for chunk {chunk_id+1}, now generating QA pairs"
+        )
 
         prompt = {
             "messages": [
@@ -248,7 +255,7 @@ class OpenWebUIProcessor:
                 },
             ],
             "temperature": 0.7,  # higher temperature for creative responses
-            "max_tokens": 4096,  # larger context window for QA generation
+            "max_tokens": 8192,  # larger context window for QA generation
         }
 
         # Enable web search for the large model call.
@@ -290,13 +297,14 @@ class OpenWebUIProcessor:
                 "raw_response": content,
             }
 
-    def validate_and_fix_jsonl(
-        self, jsonl_data: Dict[str, Any], chunk_id: int
+    async def validate_and_fix_jsonl_async(
+        self, session: aiohttp.ClientSession, jsonl_data: Dict[str, Any], chunk_id: int
     ) -> Dict[str, Any]:
         """
-        Validate JSONL data and, if necessary, fix it using the medium model.
+        Asynchronously validate JSONL data and, if necessary, fix it using the medium model.
 
         Args:
+            session: aiohttp client session
             jsonl_data: The JSONL data to validate.
             chunk_id: ID of the chunk.
 
@@ -324,12 +332,12 @@ class OpenWebUIProcessor:
                     },
                 ],
                 "temperature": 0.3,
-                "max_tokens": 4096,
+                "max_tokens": 5000,
             }
 
-            # Note: We now use the medium model for fixing.
-            response = self._make_api_request(
-                "chat/completions", prompt, self.models["medium"]
+            # Use the medium model for fixing.
+            response = await self._make_async_api_request(
+                session, "chat/completions", prompt, self.models["medium"]
             )
             try:
                 content = (
@@ -381,14 +389,18 @@ class OpenWebUIProcessor:
         """
         Process chunks from the queue asynchronously by generating QA pairs.
         Uses a maximum number of concurrent requests to avoid overwhelming the API.
+        Now uses the parallel cleaning/QA generation method.
         """
         async with aiohttp.ClientSession() as session:
             tasks = []
             chunk_id = 0
             while not self.chunk_queue.empty():
                 chunk = self.chunk_queue.get()  # FIFO order
+                # Use the new parallel method
                 task = asyncio.create_task(
-                    self.generate_qa_pairs(session, chunk, chunk_id)
+                    self.generate_qa_pairs_with_parallel_cleaning(
+                        session, chunk, chunk_id
+                    )
                 )
                 tasks.append(task)
                 chunk_id += 1
@@ -405,36 +417,72 @@ class OpenWebUIProcessor:
                     result = task.result()
                     self.result_queue.put(result)
 
-    def save_results(self) -> None:
+    async def save_results_async(self) -> None:
         """
-        Save each JSONL result from the result queue into files named
-        response_{i}_{j}.jsonl (i: file counter, j: chunk id). If a JSONL is invalid,
-        it is fixed using the medium model.
+        Asynchronously save each JSONL result from the result queue into files.
+        Now uses the async validate_and_fix_jsonl method.
         """
-        file_counter = 0
-        while not self.result_queue.empty():
-            result = self.result_queue.get()
-            chunk_id = result["chunk_id"]
-            jsonl_data = result.get("jsonl_data")
-            if jsonl_data:
-                valid_jsonl = self.validate_and_fix_jsonl(jsonl_data, chunk_id)
-                output_file = os.path.join(
-                    self.output_dir, f"response_{file_counter}_{chunk_id}.jsonl"
-                )
-                with open(output_file, "w", encoding="utf-8") as f:
-                    f.write(json.dumps(valid_jsonl))
-                logger.info(f"Saved result to {output_file}")
-                file_counter += 1
-            else:
-                error = result.get("error", "unknown error")
-                logger.error(f"Failed to process chunk {chunk_id}: {error}")
+        async with aiohttp.ClientSession() as session:
+            file_counter = 0
+            validation_tasks = []
+
+            # Create a mapping to track chunk_id for each task
+            task_to_chunk_id = {}
+
+            while not self.result_queue.empty():
+                result = self.result_queue.get()
+                chunk_id = result["chunk_id"]
+                jsonl_data = result.get("jsonl_data")
+
+                if jsonl_data:
+                    task = asyncio.create_task(
+                        self.validate_and_fix_jsonl_async(session, jsonl_data, chunk_id)
+                    )
+                    validation_tasks.append(task)
+                    task_to_chunk_id[task] = chunk_id
+
+                    # Process in batches to avoid creating too many tasks at once
+                    if len(validation_tasks) >= self.max_concurrent_requests:
+                        completed, validation_tasks = await asyncio.wait(
+                            validation_tasks, return_when=asyncio.FIRST_COMPLETED
+                        )
+                        for task in completed:
+                            chunk_id = task_to_chunk_id[task]
+                            valid_jsonl = task.result()
+                            output_file = os.path.join(
+                                self.output_dir,
+                                f"response_{file_counter}_{chunk_id}.jsonl",
+                            )
+                            with open(output_file, "w", encoding="utf-8") as f:
+                                f.write(json.dumps(valid_jsonl))
+                            logger.info(f"Saved result to {output_file}")
+                            file_counter += 1
+                            # Remove from mapping
+                            del task_to_chunk_id[task]
+                else:
+                    error = result.get("error", "unknown error")
+                    logger.error(f"Failed to process chunk {chunk_id}: {error}")
+
+            # Process any remaining validation tasks 
+            if validation_tasks:
+                completed, _ = await asyncio.wait(validation_tasks)
+                for task in completed:
+                    chunk_id = task_to_chunk_id[task]
+                    valid_jsonl = task.result()
+                    output_file = os.path.join(
+                        self.output_dir, f"response_{file_counter}_{chunk_id}.jsonl"
+                    )
+                    with open(output_file, "w", encoding="utf-8") as f:
+                        f.write(json.dumps(valid_jsonl))
+                    logger.info(f"Saved result to {output_file}")
+                    file_counter += 1
 
     async def run(self) -> None:
         """
         Main execution method:
           1. Fetch all .txt files from the input directory.
           2. Process each file (chunking text into semantic units).
-          3. Process chunks concurrently to generate QA pairs.
+          3. Process chunks concurrently to generate QA pairs with parallel cleaning.
           4. Save results to individual JSONL files.
         """
         input_files = glob.glob(os.path.join(self.input_dir, "*.txt"))
@@ -445,21 +493,22 @@ class OpenWebUIProcessor:
             for file_path in input_files:
                 executor.submit(self.process_file, file_path)
         await self.process_chunks()
-        self.save_results()
+        # Use the async version for saving results
+        await self.save_results_async()
         logger.info("Processing complete!")
 
     def count_tokens(self, text, encoder):
         """Return the token count of text using the given encoder."""
         return len(encoder.encode(text))
 
-    def chunk_text(self, text, max_tokens=4096):
+    def chunk_text(self, text, max_tokens=5000):
         """
         Splits text into chunks under max_tokens WITHOUT cleaning.
-        The cleaning will happen later in the generate_qa_pairs method.
+        The cleaning will happen in parallel with QA generation.
 
         Args:
             text: Input text to chunk
-            max_tokens: Maximum tokens per chunk (default: 4096)
+            max_tokens: Maximum tokens per chunk (default: 5000)
 
         Returns:
             List of text chunks (not yet cleaned)
