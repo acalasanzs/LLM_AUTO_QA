@@ -6,7 +6,7 @@ import asyncio
 import aiohttp
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 from queue import Queue
 from dotenv import load_dotenv
 import re
@@ -46,6 +46,9 @@ class OpenWebUIProcessor:
         self.input_dir = os.getenv("INPUT_DIR", "./input")
         self.output_dir = os.getenv("OUTPUT_DIR", "./output")
         self.max_concurrent_requests = int(os.getenv("MAX_CONCURRENT_REQUESTS", "5"))
+        self.request_timeout = int(
+            os.getenv("REQUEST_TIMEOUT", "300")
+        )  # 5 minutes timeout
 
         # Set up model IDs from environment variables
         self.models = {
@@ -71,111 +74,79 @@ class OpenWebUIProcessor:
         # Create output directory if it doesn't exist
         os.makedirs(self.output_dir, exist_ok=True)
 
-    def _make_api_request(
-        self,
-        endpoint: str,
-        data: Dict[str, Any],
-        model_id: str,
-        web_search: bool = False,
-    ) -> Dict[str, Any]:
-        """
-        Make a synchronous API request to Open-WebUI.
-        """
-        url = f"{self.base_url}/{endpoint}"
-        if web_search:
-            url = f"{url}?web-search=true"
-
-        data["model"] = model_id
-
-        try:
-            response = requests.post(url, headers=self.headers, json=data)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"API request failed: {e}")
-            raise
-
-    async def _make_async_api_request(
+    async def _make_streaming_api_request(
         self,
         session: aiohttp.ClientSession,
         endpoint: str,
         data: Dict[str, Any],
         model_id: str,
         web_search: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> str:
         """
-        Make an asynchronous API request to Open-WebUI.
-        Retries the request if a ServerDisconnectedError is encountered.
+        Make an asynchronous streaming API request to Open-WebUI.
+        Collects streamed tokens and returns the complete response.
         """
         url = f"{self.base_url}/{endpoint}"
         if web_search:
             url = f"{url}?web-search=true"
 
+        # Add stream parameter to request
         data["model"] = model_id
+        data["stream"] = True
 
         max_retries = 3
         backoff_delay = 2  # seconds
+        complete_response = ""
 
         for attempt in range(1, max_retries + 1):
             try:
                 async with session.post(
-                    url, headers=self.headers, json=data
+                    url, headers=self.headers, json=data, timeout=self.request_timeout
                 ) as response:
                     response.raise_for_status()
-                    return await response.json()
+                    # Process the streaming response
+                    async for line in response.content:
+                        line = line.decode("utf-8").strip()
+                        if not line:
+                            continue
+                        if line.startswith("data: "):
+                            line = line[6:]  # Remove 'data: ' prefix
+                        if line == "[DONE]":
+                            break
+                        try:
+                            # Parse the JSON chunk
+                            chunk = json.loads(line)
+                            delta_content = (
+                                chunk.get("choices", [{}])[0]
+                                .get("delta", {})
+                                .get("content", "")
+                            )
+                            complete_response += delta_content
+                        except json.JSONDecodeError:
+                            logger.warning(f"Failed to parse streaming chunk: {line}")
+
+                    return complete_response
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Request timed out on attempt {attempt}/{max_retries}. Retrying..."
+                )
+                if attempt < max_retries:
+                    await asyncio.sleep(backoff_delay * attempt)  # Exponential backoff
+                else:
+                    logger.error("Max retries reached due to timeouts.")
+                    raise
             except aiohttp.client_exceptions.ServerDisconnectedError as e:
                 logger.warning(
                     f"Server disconnected error on attempt {attempt}/{max_retries}: {e}"
                 )
                 if attempt < max_retries:
-                    await asyncio.sleep(backoff_delay)
+                    await asyncio.sleep(backoff_delay * attempt)  # Exponential backoff
                 else:
                     logger.error("Max retries reached. Server is disconnecting.")
                     raise
             except aiohttp.ClientError as e:
                 logger.error(f"Async API request failed: {e}")
                 raise
-
-    async def process_chunk_and_save(
-        self, session: aiohttp.ClientSession, chunk: str, chunk_id: int
-    ) -> None:
-        """
-        Process a single chunk:
-          - Generate QA pairs with parallel cleaning.
-          - Validate (and fix) the resulting JSONL data.
-          - Immediately save the output to a file.
-
-        If a repeated server disconnection error occurs, the file corresponding to the chunk is omitted.
-        """
-        try:
-            result = await self.generate_qa_pairs_with_parallel_cleaning(
-                session, chunk, chunk_id
-            )
-        except aiohttp.client_exceptions.ServerDisconnectedError as e:
-            logger.error(
-                f"Skipping chunk {chunk_id} due to repeated server disconnections: {e}"
-            )
-            return
-
-        jsonl_data = result.get("jsonl_data")
-        if jsonl_data:
-            try:
-                valid_jsonl = await self.validate_and_fix_jsonl_async(
-                    session, jsonl_data, chunk_id
-                )
-                output_file = os.path.join(
-                    self.output_dir, f"response_{chunk_id}.jsonl"
-                )
-                with open(output_file, "w", encoding="utf-8") as f:
-                    f.write(json.dumps(valid_jsonl))
-                logger.info(f"Saved result to {output_file}")
-            except aiohttp.client_exceptions.ServerDisconnectedError as e:
-                logger.error(
-                    f"Skipping file save for chunk {chunk_id} due to server disconnection: {e}"
-                )
-        else:
-            error = result.get("error", "unknown error")
-            logger.error(f"Failed to process chunk {chunk_id}: {error}")
 
     async def clean_text_async(self, session: aiohttp.ClientSession, text: str) -> str:
         """
@@ -217,23 +188,19 @@ class OpenWebUIProcessor:
                     },
                     {
                         "role": "user",
-                        "content": f"Clean the following text by removing any website UI elements, navigation menus, footers, ads, and other non-content elements. Return ONLY the cleaned text with no explanations:\n\n{text[:4096]}",
+                        "content": f"Clean the following text by removing any website UI elements, navigation menus, footers, ads, and other non-content elements. Return ONLY the cleaned text with no explanations:\n\n{text[:7000]}",
                     },
                 ],
                 "temperature": 0.1,
-                "max_tokens": 5000,
+                "max_tokens": 7000,
             }
             try:
                 logger.info("Attempting to clean text with small model")
-                response = await self._make_async_api_request(
+                response_content = await self._make_streaming_api_request(
                     session, "chat/completions", clean_prompt, self.models["small"]
                 )
-                model_cleaned_text = (
-                    response.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                )
-                if model_cleaned_text and len(model_cleaned_text.strip()) > 100:
+                model_cleaned_text = response_content.strip()
+                if model_cleaned_text and len(model_cleaned_text) > 100:
                     logger.info("Successfully cleaned text with small model")
                     cleaned_text = model_cleaned_text
                 else:
@@ -279,18 +246,21 @@ class OpenWebUIProcessor:
             "max_tokens": 8192,
         }
 
-        response = await self._make_async_api_request(
-            session, "chat/completions", prompt, self.models["large"], web_search=True
-        )
         try:
-            content = (
-                response.get("choices", [{}])[0].get("message", {}).get("content", "")
+            response_content = await self._make_streaming_api_request(
+                session,
+                "chat/completions",
+                prompt,
+                self.models["large"],
+                web_search=True,
             )
-            json_match = re.search(r"\[.*\]", content, re.DOTALL)
+
+            json_match = re.search(r"\[.*\]", response_content, re.DOTALL)
             if json_match:
                 qa_pairs = json.loads(json_match.group(0))
             else:
-                qa_pairs = json.loads(content)
+                qa_pairs = json.loads(response_content)
+
             jsonl_data = {
                 "messages": [
                     {"role": "system", "content": "You are a helpful assistant."}
@@ -310,7 +280,7 @@ class OpenWebUIProcessor:
                 "chunk_id": chunk_id,
                 "jsonl_data": None,
                 "error": str(e),
-                "raw_response": content,
+                "raw_response": response_content,
             }
 
     async def validate_and_fix_jsonl_async(
@@ -339,23 +309,19 @@ class OpenWebUIProcessor:
                     },
                 ],
                 "temperature": 0.3,
-                "max_tokens": 5000,
+                "max_tokens": 7000,
             }
-            response = await self._make_async_api_request(
+
+            response_content = await self._make_streaming_api_request(
                 session, "chat/completions", prompt, self.models["medium"]
             )
+
             try:
-                content = (
-                    response.get("choices", [{}])
-                    .pop(0)
-                    .get("message", {})
-                    .get("content", "")
-                )
-                json_match = re.search(r"\{.*\}", content, re.DOTALL)
+                json_match = re.search(r"\{.*\}", response_content, re.DOTALL)
                 if json_match:
                     fixed_jsonl = json.loads(json_match.group(0))
                 else:
-                    fixed_jsonl = json.loads(content)
+                    fixed_jsonl = json.loads(response_content)
                 return fixed_jsonl
             except (json.JSONDecodeError, IndexError) as e:
                 logger.error(f"Failed to fix JSONL: {e}")
@@ -369,6 +335,51 @@ class OpenWebUIProcessor:
                         },
                     ]
                 }
+
+    async def process_chunk_and_save(
+        self, session: aiohttp.ClientSession, chunk: str, chunk_id: int
+    ) -> None:
+        """
+        Process a single chunk:
+          - Generate QA pairs with parallel cleaning.
+          - Validate (and fix) the resulting JSONL data.
+          - Immediately save the output to a file.
+
+        If a repeated server disconnection error occurs, the file corresponding to the chunk is omitted.
+        """
+        try:
+            result = await self.generate_qa_pairs_with_parallel_cleaning(
+                session, chunk, chunk_id
+            )
+        except (
+            aiohttp.client_exceptions.ServerDisconnectedError,
+            asyncio.TimeoutError,
+        ) as e:
+            logger.error(f"Skipping chunk {chunk_id} due to connection issues: {e}")
+            return
+
+        jsonl_data = result.get("jsonl_data")
+        if jsonl_data:
+            try:
+                valid_jsonl = await self.validate_and_fix_jsonl_async(
+                    session, jsonl_data, chunk_id
+                )
+                output_file = os.path.join(
+                    self.output_dir, f"response_{chunk_id}.jsonl"
+                )
+                with open(output_file, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(valid_jsonl))
+                logger.info(f"Saved result to {output_file}")
+            except (
+                aiohttp.client_exceptions.ServerDisconnectedError,
+                asyncio.TimeoutError,
+            ) as e:
+                logger.error(
+                    f"Skipping file save for chunk {chunk_id} due to connection issues: {e}"
+                )
+        else:
+            error = result.get("error", "unknown error")
+            logger.error(f"Failed to process chunk {chunk_id}: {error}")
 
     def process_file(self, file_path: str) -> None:
         """
@@ -388,25 +399,34 @@ class OpenWebUIProcessor:
         except Exception as e:
             logger.error(f"Error processing file {file_path}: {e}")
 
-    async def process_chunks_and_save(self) -> None:
+    async def process_chunks_with_semaphore(self) -> None:
         """
-        Process chunks from the queue asynchronously by generating QA pairs and immediately saving each result to its own file.
+        Process chunks from the queue asynchronously using a semaphore to limit concurrent requests.
+        This helps prevent overloading the server and hitting timeouts.
         """
-        async with aiohttp.ClientSession() as session:
+        semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+
+        async def process_with_semaphore(session, chunk, chunk_id):
+            async with semaphore:
+                await self.process_chunk_and_save(session, chunk, chunk_id)
+
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self.request_timeout)
+        ) as session:
             tasks = []
             chunk_id = 0
+
             while not self.chunk_queue.empty():
-                chunk = self.chunk_queue.get()  # FIFO order
+                chunk = self.chunk_queue.get()
                 task = asyncio.create_task(
-                    self.process_chunk_and_save(session, chunk, chunk_id)
+                    process_with_semaphore(session, chunk, chunk_id)
                 )
                 tasks.append(task)
                 chunk_id += 1
-                if len(tasks) >= self.max_concurrent_requests:
-                    await asyncio.gather(*tasks)
-                    tasks = []
+
             if tasks:
-                await asyncio.gather(*tasks)
+                # Wait for all tasks to complete
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     async def run(self) -> None:
         """
@@ -419,17 +439,20 @@ class OpenWebUIProcessor:
         if not input_files:
             logger.warning(f"No .txt files found in {self.input_dir}")
             return
-        with ThreadPoolExecutor() as executor:
-            for file_path in input_files:
-                executor.submit(self.process_file, file_path)
-        await self.process_chunks_and_save()
-        logger.info("Processing complete!")
+
+        # Process files sequentially to avoid memory issues
+        for file_path in input_files:
+            self.process_file(file_path)
+            await self.process_chunks_with_semaphore()
+            logger.info(f"Completed processing file: {file_path}")
+
+        logger.info("All processing complete!")
 
     def count_tokens(self, text, encoder):
         """Return the token count of text using the given encoder."""
         return len(encoder.encode(text))
 
-    def chunk_text(self, text, max_tokens=5000):
+    def chunk_text(self, text, max_tokens=7000):
         """
         Splits text into chunks under max_tokens WITHOUT cleaning.
         The cleaning will happen in parallel with QA generation.
