@@ -6,8 +6,9 @@ import asyncio
 import aiohttp
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from queue import Queue
+from collections import deque
 from dotenv import load_dotenv
 import re
 import nltk
@@ -46,21 +47,19 @@ class OpenWebUIProcessor:
         self.api_key = os.getenv("API_KEY", "")
         self.input_dir = os.getenv("INPUT_DIR", "./input")
         self.output_dir = os.getenv("OUTPUT_DIR", "./output")
-        self.max_concurrent_requests = int(
-            os.getenv("MAX_CONCURRENT_REQUESTS", "3")
-        )  # Reduced from 5 to 3
+        self.max_concurrent_requests = int(os.getenv("MAX_CONCURRENT_REQUESTS", "3"))
         self.request_timeout = int(
             os.getenv("REQUEST_TIMEOUT", "180")
         )  # 3 minutes timeout
         self.max_retries = int(os.getenv("MAX_RETRIES", "5"))
-        self.chunk_size = int(
-            os.getenv("CHUNK_SIZE", "4000")
-        )  # Reduced from 5000 to 4000
+
+        # Standardize chunk size - consistent value throughout the code
+        self.chunk_size = int(os.getenv("CHUNK_SIZE", "6000"))
 
         # Set up model IDs from environment variables
         self.models = {
-            "small": os.getenv("small_MODEL_ID", "gemma-3-27b-it"),
-            "medium": os.getenv("medium_MODEL_ID", "gemma-3-27b-it"),
+            "small": os.getenv("small_MODEL_ID", "qwen2.5-coder-14b-instruct-mlx"),
+            "medium": os.getenv("medium_MODEL_ID", "qwen2.5-coder-14b-instruct-mlx"),
             "large": os.getenv(
                 "LARGE_MODEL_ID", "deepseek-r1-distill-qwen-32b-abliterated"
             ),
@@ -75,8 +74,11 @@ class OpenWebUIProcessor:
             "Authorization": f"Bearer {self.api_key}",
         }
 
-        # Queue to hold text chunks
-        self.chunk_queue = Queue()
+        # FIFO Queue for processing pipeline
+        self.processing_queue = asyncio.Queue()
+
+        # Semaphore to control concurrent API requests
+        self.api_semaphore = None
 
         # Create output directory if it doesn't exist
         os.makedirs(self.output_dir, exist_ok=True)
@@ -113,8 +115,8 @@ class OpenWebUIProcessor:
         data["stream"] = True
 
         # Reduce token generation when possible
-        if "max_tokens" in data and data["max_tokens"] > 4000:
-            data["max_tokens"] = 4000
+        if "max_tokens" in data and data["max_tokens"] > 6000:
+            data["max_tokens"] = 6000
 
         complete_response = ""
 
@@ -196,202 +198,262 @@ class OpenWebUIProcessor:
             headers=self.headers,
         )
 
-    async def clean_text_async(self, session: aiohttp.ClientSession, text: str) -> str:
+    async def clean_text_async(
+        self, session: aiohttp.ClientSession, text: str, chunk_id: int
+    ) -> str:
         """
         Asynchronously clean text by removing UI elements using both model-based and regex-based approaches.
         Fallback to regex-based cleaning if model-based cleaning fails.
         """
+        async with self.api_semaphore:
+            logger.info(f"Started cleaning text for chunk {chunk_id}")
 
-        def regex_clean_text(input_text):
-            """Basic cleaning using regex patterns to remove common UI elements"""
-            patterns = [
-                r"Cookie Policy.*?(?=\n\n|\Z)",
-                r"Accept\s+(?:All)?\s*Cookies",
-                r"Navigation Menu",
-                r"Search\.\.\.",
-                r"Share\s+(?:on)?\s+(?:Twitter|Facebook|LinkedIn)",
-                r"©\s*\d{4}.*?(?=\n|\Z)",
-                r"All Rights Reserved",
-                r"Terms of (?:Use|Service)",
-                r"Privacy Policy",
-                r"\[\s*menu\s*\]",
-                r"\[\s*footer\s*\]",
-                r"\[\s*header\s*\]",
-                r"\[\s*sidebar\s*\]",
-                r"\[\s*advertisement\s*\]",
-            ]
-            cleaned = input_text
-            for pattern in patterns:
-                cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
-            cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-            cleaned = re.sub(r"\s{2,}", " ", cleaned)
-            return cleaned.strip()
+            def regex_clean_text(input_text):
+                """Basic cleaning using regex patterns to remove common UI elements"""
+                patterns = [
+                    r"Cookie Policy.*?(?=\n\n|\Z)",
+                    r"Accept\s+(?:All)?\s*Cookies",
+                    r"Navigation Menu",
+                    r"Search\.\.\.",
+                    r"Share\s+(?:on)?\s+(?:Twitter|Facebook|LinkedIn)",
+                    r"©\s*\d{4}.*?(?=\n|\Z)",
+                    r"All Rights Reserved",
+                    r"Terms of (?:Use|Service)",
+                    r"Privacy Policy",
+                    r"\[\s*menu\s*\]",
+                    r"\[\s*footer\s*\]",
+                    r"\[\s*header\s*\]",
+                    r"\[\s*sidebar\s*\]",
+                    r"\[\s*advertisement\s*\]",
+                ]
+                cleaned = input_text
+                for pattern in patterns:
+                    cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+                cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+                cleaned = re.sub(r"\s{2,}", " ", cleaned)
+                return cleaned.strip()
 
-        # Use regex cleaning as a default
-        cleaned_text = regex_clean_text(text)
+            # Use regex cleaning as a default
+            cleaned_text = regex_clean_text(text)
 
-        # Short texts don't need model-based cleaning
-        if len(text) < 1000:
-            return cleaned_text
+            # Short texts don't need model-based cleaning
+            if len(text) < 1000:
+                logger.info(f"Chunk {chunk_id} is short, skipping model-based cleaning")
+                return cleaned_text
 
-        try:
-            clean_prompt = {
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are a text processor that cleans and structures text content.",
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Clean the following text by removing any website UI elements, navigation menus, footers, ads, and other non-content elements. Return ONLY the cleaned text with no explanations:\n\n{text[:3000]}",
-                    },
-                ],
-                "temperature": 0.1,
-                "max_tokens": 3500,
-            }
+            try:
+                clean_prompt = {
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a text processor that cleans and structures text content.",
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Clean the following text by removing any website UI elements, navigation menus, footers, ads, and other non-content elements. Return ONLY the cleaned text with no explanations:\n\n{text}",
+                        },
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 8192,
+                }
 
-            logger.info("Attempting to clean text with small model")
-            response_content = await self._make_streaming_api_request(
-                session, "chat/completions", clean_prompt, self.models["small"]
-            )
+                logger.info(
+                    f"Attempting to clean text with small model for chunk {chunk_id}"
+                )
+                response_content = await self._make_streaming_api_request(
+                    session, "chat/completions", clean_prompt, self.models["small"]
+                )
 
-            model_cleaned_text = response_content.strip()
-            if model_cleaned_text and len(model_cleaned_text) > 100:
-                logger.info("Successfully cleaned text with small model")
-                return model_cleaned_text
-            else:
+                model_cleaned_text = response_content.strip()
+                if model_cleaned_text and len(model_cleaned_text) > 100:
+                    logger.info(
+                        f"Successfully cleaned text with small model for chunk {chunk_id}"
+                    )
+                    return model_cleaned_text
+                else:
+                    logger.warning(
+                        f"Small model returned insufficient cleaned text for chunk {chunk_id}. Using regex cleaning."
+                    )
+                    return cleaned_text
+
+            except Exception as e:
                 logger.warning(
-                    "Small model returned insufficient cleaned text. Using regex cleaning."
+                    f"Model-based cleaning failed for chunk {chunk_id}: {str(e)}. Using regex cleaning."
                 )
                 return cleaned_text
 
-        except Exception as e:
-            logger.warning(
-                f"Model-based cleaning failed: {str(e)}. Using regex cleaning."
-            )
-            return cleaned_text
-
-    async def generate_qa_pairs_with_parallel_cleaning(
-        self, session: aiohttp.ClientSession, chunk: str, chunk_id: int
+    async def _generate_qa_pairs(
+        self,
+        session: aiohttp.ClientSession,
+        chunk: str,
+        chunk_id: int,
+        model_id: str,
+        web_search: bool,
     ) -> Dict[str, Any]:
         """
-        Generate question-answer pairs for a chunk using the large model with web search enabled,
-        while cleaning the text in parallel.
+        Helper method to generate QA pairs from a chunk of text.
         """
-        if len(chunk) > 3000:
-            cleaning_task = asyncio.create_task(self.clean_text_async(session, chunk))
-            logger.info(f"Started parallel cleaning for chunk {chunk_id}")
-            cleaned_chunk = await cleaning_task
-            logger.info(
-                f"Completed cleaning for chunk {chunk_id}, now generating QA pairs"
-            )
-        else:
-            # For small chunks, skip model-based cleaning
-            cleaned_chunk = chunk
-            logger.info(f"Chunk {chunk_id} is small, skipping model-based cleaning")
+        async with self.api_semaphore:
+            logger.info(f"Started generating QA pairs for chunk {chunk_id}")
 
-        # Limit the size of the chunk to process
-        if len(cleaned_chunk) > 4000:
-            cleaned_chunk = cleaned_chunk[:4000]
-            logger.info(f"Truncated chunk {chunk_id} to 4000 chars")
+            # Limit the size of the chunk to process
+            if len(chunk) > 8000:
+                chunk = chunk[:8000]
+                logger.info(f"Truncated chunk {chunk_id} to 6000 chars")
 
-        prompt = {
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant. Generate relevant question-answer pairs about the following text.",
-                },
-                {
-                    "role": "user",
-                    "content": f"Generate 3 question-answer pairs for the following text. Format your response as a JSON array of objects where each object has a 'question' and 'answer' field: {cleaned_chunk}",
-                },
-            ],
-            "temperature": 0.7,
-            "max_tokens": 3000,  # Reduced from 8192
-        }
-
-        try:
-            response_content = await self._make_streaming_api_request(
-                session,
-                "chat/completions",
-                prompt,
-                self.models["large"],
-                web_search=False,
-            )
-
-            # Find JSON in the response
-            json_match = re.search(r"\[.*?\]", response_content, re.DOTALL)
-
-            if json_match:
-                try:
-                    qa_pairs = json.loads(json_match.group(0))
-                except json.JSONDecodeError:
-                    # If JSON is malformed, try to fix it
-                    fixed_json = self._fix_json_string(json_match.group(0))
-                    qa_pairs = json.loads(fixed_json)
-            else:
-                # If no JSON array found, try to parse the entire response
-                try:
-                    qa_pairs = json.loads(response_content)
-                except json.JSONDecodeError:
-                    # If still fails, create a simple structure
-                    qa_pairs = [
-                        {
-                            "question": "What is the main topic of this text?",
-                            "answer": "The text discusses various topics that couldn't be structured into proper QA pairs.",
-                        }
-                    ]
-
-            jsonl_data = {
+            prompt = {
                 "messages": [
-                    {"role": "system", "content": "You are a helpful assistant."}
-                ]
-            }
-
-            for pair in qa_pairs:
-                if isinstance(pair, dict) and "question" in pair and "answer" in pair:
-                    jsonl_data["messages"].append(
-                        {"role": "user", "content": pair["question"]}
-                    )
-                    jsonl_data["messages"].append(
-                        {"role": "assistant", "content": pair["answer"]}
-                    )
-
-            return {"chunk_id": chunk_id, "jsonl_data": jsonl_data}
-
-        except Exception as e:
-            logger.error(f"Failed to generate QA pairs for chunk {chunk_id}: {e}")
-            # Create a simple fallback response
-            jsonl_data = {
-                "messages": [
-                    {"role": "system", "content": "You are a helpful assistant."},
+                    {
+                        "role": "system",
+                        "content": "You are a helpful assistant. Generate relevant 30 question-answer pairs about the following text.",
+                    },
                     {
                         "role": "user",
-                        "content": "Can you summarize the key points from this text?",
+                        "content": f"Generate 30 question-answer pairs for the following text. Format your response as a JSON array of objects where each object has a 'question' and 'answer' field: {chunk}",
                     },
-                    {
-                        "role": "assistant",
-                        "content": f"I encountered an error processing this chunk of text. Error: {str(e)}",
-                    },
-                ]
+                ],
+                "temperature": 0.7,
+                "max_tokens": 8192,
             }
-            return {"chunk_id": chunk_id, "jsonl_data": jsonl_data}
 
-    def _fix_json_string(self, json_str):
-        """Attempt to fix common JSON parsing issues."""
-        # Replace single quotes with double quotes
-        fixed = json_str.replace("'", '"')
+            try:
+                response_content = await self._make_streaming_api_request(
+                    session, "chat/completions", prompt, model_id, web_search=web_search
+                )
 
-        # Ensure property names are in double quotes
-        fixed = re.sub(r"(\w+):", r'"\1":', fixed)
+                # Find JSON in the response
+                json_match = re.search(r"\[.*?\]", response_content, re.DOTALL)
 
-        # Fix missing commas between objects
-        fixed = re.sub(r"}\s*{", "},{", fixed)
+                if json_match:
+                    try:
+                        qa_pairs = json.loads(json_match.group(0))
+                    except json.JSONDecodeError:
+                        # If JSON is malformed, try to fix it
+                        fixed_json = await self._fix_json_string_async(
+                            session, json_match.group(0), chunk_id
+                        )
+                        qa_pairs = json.loads(fixed_json)
+                else:
+                    # If no JSON array found, try to parse the entire response
+                    try:
+                        qa_pairs = json.loads(response_content)
+                    except json.JSONDecodeError:
+                        # If still fails, create a simple structure
+                        qa_pairs = [
+                            {
+                                "question": "What is the main topic of this text?",
+                                "answer": "The text discusses various topics that couldn't be structured into proper QA pairs.",
+                            }
+                        ]
 
-        # Fix trailing commas in arrays
-        fixed = re.sub(r",\s*]", "]", fixed)
+                jsonl_data = {
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant."}
+                    ]
+                }
 
-        return fixed
+                for pair in qa_pairs:
+                    if (
+                        isinstance(pair, dict)
+                        and "question" in pair
+                        and "answer" in pair
+                    ):
+                        jsonl_data["messages"].append(
+                            {"role": "user", "content": pair["question"]}
+                        )
+                        jsonl_data["messages"].append(
+                            {"role": "assistant", "content": pair["answer"]}
+                        )
+
+                logger.info(f"Successfully generated QA pairs for chunk {chunk_id}")
+                return {"chunk_id": chunk_id, "jsonl_data": jsonl_data}
+
+            except Exception as e:
+                logger.error(f"Failed to generate QA pairs for chunk {chunk_id}: {e}")
+                # Create a simple fallback response
+                jsonl_data = {
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {
+                            "role": "user",
+                            "content": "Can you summarize the key points from this text?",
+                        },
+                        {
+                            "role": "assistant",
+                            "content": f"I encountered an error processing this chunk of text. Error: {str(e)}",
+                        },
+                    ]
+                }
+                return {"chunk_id": chunk_id, "jsonl_data": jsonl_data}
+
+    async def _fix_json_string_async(
+        self, session: aiohttp.ClientSession, json_str: str, chunk_id: int
+    ) -> str:
+        """
+        Attempt to fix JSON parsing issues using both manual fixes and model-based assistance.
+        """
+
+        def manual_fix_json(json_str):
+            """Attempt to fix common JSON parsing issues."""
+            # Replace single quotes with double quotes
+            fixed = json_str.replace("'", '"')
+
+            # Ensure property names are in double quotes
+            fixed = re.sub(r"(\w+):", r'"\1":', fixed)
+
+            # Fix missing commas between objects
+            fixed = re.sub(r"}\s*{", "},{", fixed)
+
+            # Fix trailing commas in arrays
+            fixed = re.sub(r",\s*]", "]", fixed)
+
+            return fixed
+
+        # Try manual fixing first
+        try:
+            fixed_json = manual_fix_json(json_str)
+            json.loads(fixed_json)  # Test if valid
+            return fixed_json
+        except (json.JSONDecodeError, Exception):
+            # If manual fixing fails, try using the medium model for more complex fixes
+            try:
+                # Only use the model for complex cases when manual fixing fails
+                fix_prompt = {
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a JSON repair specialist. Fix the invalid JSON and return only the corrected JSON with no additional text.",
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Fix this invalid JSON and return only the corrected JSON:\n\n{json_str}",
+                        },
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 8192,
+                }
+
+                logger.info(f"Using medium model to fix JSON for chunk {chunk_id}")
+                async with self.api_semaphore:
+                    response_content = await self._make_streaming_api_request(
+                        session, "chat/completions", fix_prompt, self.models["medium"]
+                    )
+
+                # Try to extract valid JSON from the response
+                json_match = re.search(r"\[.*?\]", response_content, re.DOTALL)
+                if json_match:
+                    try:
+                        fixed_json = json_match.group(0)
+                        json.loads(fixed_json)  # Test if valid
+                        return fixed_json
+                    except json.JSONDecodeError:
+                        pass
+
+                # If no valid JSON array was found, try a simpler approach
+                return '[\n  {\n    "question": "What is the main topic?",\n    "answer": "The content was not properly structured due to JSON parsing issues."\n  }\n]'
+            except Exception as e:
+                logger.error(f"Failed to fix JSON with model for chunk {chunk_id}: {e}")
+                return '[\n  {\n    "question": "What is the main topic?",\n    "answer": "The content was not properly structured due to JSON parsing issues."\n  }\n]'
 
     async def validate_and_fix_jsonl_async(
         self, session: aiohttp.ClientSession, jsonl_data: Dict[str, Any], chunk_id: int
@@ -444,45 +506,75 @@ class OpenWebUIProcessor:
                 logger.error(f"Failed to fix JSONL manually for chunk {chunk_id}")
                 return fallback_data
 
-    async def process_chunk_and_save(
-        self, session: aiohttp.ClientSession, chunk: str, chunk_id: int
-    ) -> None:
+    async def process_pipeline(self, session: aiohttp.ClientSession):
         """
-        Process a single chunk with improved error handling and save the result.
+        Process chunks from the FIFO queue, handling cleaning and QA generation in parallel.
+        This is the main worker that processes items from the queue.
         """
-        try:
-            # Set a timeout for the entire processing of this chunk
-            result = await asyncio.wait_for(
-                self.generate_qa_pairs_with_parallel_cleaning(session, chunk, chunk_id),
-                timeout=self.request_timeout * 1.5,
-            )
+        while True:
+            try:
+                # Get the next item from the queue
+                item = await self.processing_queue.get()
 
-            jsonl_data = result.get("jsonl_data")
-            if jsonl_data:
-                valid_jsonl = await self.validate_and_fix_jsonl_async(
-                    session, jsonl_data, chunk_id
-                )
+                if item is None:  # None is our signal to stop
+                    self.processing_queue.task_done()
+                    break
 
-                # Save the result
-                output_file = os.path.join(
-                    self.output_dir, f"response_{chunk_id}.jsonl"
-                )
+                chunk, chunk_id, output_dir = item
 
-                with open(output_file, "w", encoding="utf-8") as f:
-                    json.dump(valid_jsonl, f, ensure_ascii=False)
+                try:
+                    # Step 1: Clean text asynchronously
+                    logger.info(
+                        f"Pipeline: Starting text cleaning for chunk {chunk_id}"
+                    )
+                    cleaned_text = await self.clean_text_async(session, chunk, chunk_id)
 
-                logger.info(f"Saved result to {output_file}")
-            else:
-                logger.error(f"No valid JSONL data for chunk {chunk_id}")
+                    # Step 2: Generate QA pairs from cleaned text
+                    logger.info(
+                        f"Pipeline: Starting QA generation for chunk {chunk_id}"
+                    )
+                    result = await self._generate_qa_pairs(
+                        session, cleaned_text, chunk_id, self.models["large"], False
+                    )
 
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout processing chunk {chunk_id}")
-            self._save_error_file(chunk_id, "Timeout error")
-        except Exception as e:
-            logger.error(f"Error processing chunk {chunk_id}: {str(e)}")
-            self._save_error_file(chunk_id, str(e))
+                    # Step 3: Validate and fix JSONL if needed
+                    jsonl_data = result.get("jsonl_data")
+                    if jsonl_data:
+                        valid_jsonl = await self.validate_and_fix_jsonl_async(
+                            session, jsonl_data, chunk_id
+                        )
 
-    def _save_error_file(self, chunk_id, error_message):
+                        # Step 4: Save the result
+                        output_file = os.path.join(
+                            output_dir, f"response_{chunk_id}.jsonl"
+                        )
+                        with open(output_file, "w", encoding="utf-8") as f:
+                            json.dump(valid_jsonl, f, ensure_ascii=False)
+
+                        logger.info(f"Saved result to {output_file}")
+                    else:
+                        logger.error(f"No valid JSONL data for chunk {chunk_id}")
+                        self._save_error_file(
+                            chunk_id, "No valid JSONL data", output_dir
+                        )
+
+                except asyncio.TimeoutError:
+                    logger.error(f"Timeout processing chunk {chunk_id}")
+                    self._save_error_file(chunk_id, "Timeout error", output_dir)
+                except Exception as e:
+                    logger.error(f"Error processing chunk {chunk_id}: {str(e)}")
+                    self._save_error_file(chunk_id, str(e), output_dir)
+                finally:
+                    # Mark this task as done
+                    self.processing_queue.task_done()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Unexpected error in pipeline: {str(e)}")
+                continue
+
+    def _save_error_file(self, chunk_id, error_message, output_dir):
         """Save an error file for failed chunks."""
         error_data = {
             "messages": [
@@ -495,7 +587,7 @@ class OpenWebUIProcessor:
             ]
         }
 
-        output_file = os.path.join(self.output_dir, f"error_{chunk_id}.jsonl")
+        output_file = os.path.join(output_dir, f"error_{chunk_id}.jsonl")
 
         try:
             with open(output_file, "w", encoding="utf-8") as f:
@@ -504,9 +596,9 @@ class OpenWebUIProcessor:
         except Exception as e:
             logger.error(f"Failed to save error file: {str(e)}")
 
-    def process_file(self, file_path: str) -> None:
+    def process_file(self, file_path: str) -> Tuple[List[str], str]:
         """
-        Process a single text file: read content, chunk it, and add to the queue.
+        Process a single text file: read content, chunk it, and return the chunks with output directory.
         """
         logger.info(f"Processing file: {file_path}")
         try:
@@ -523,111 +615,68 @@ class OpenWebUIProcessor:
             chunks = self.chunk_text(text, max_tokens=self.chunk_size)
             logger.info(f"Split text into {len(chunks)} chunks")
 
-            # Clear the queue before adding new chunks
-            while not self.chunk_queue.empty():
-                self.chunk_queue.get()
-
-            for chunk in chunks:
-                self.chunk_queue.put((chunk, file_output_dir))
+            return chunks, file_output_dir
 
         except Exception as e:
             logger.error(f"Error processing file {file_path}: {e}")
-
-    async def process_chunks_with_semaphore(self, file_output_dir) -> None:
-        """
-        Process chunks using a semaphore to limit concurrent requests.
-        Each file is processed separately to avoid memory issues.
-        """
-        # Create a semaphore with a lower limit to prevent overloading
-        semaphore = asyncio.Semaphore(self.max_concurrent_requests)
-
-        async def process_with_semaphore(session, chunk, chunk_id, output_dir):
-            async with semaphore:
-                # Store the original output directory
-                original_output_dir = self.output_dir
-
-                try:
-                    # Set the output directory to the file-specific directory
-                    self.output_dir = output_dir
-
-                    # Process the chunk with a timeout
-                    await asyncio.wait_for(
-                        self.process_chunk_and_save(session, chunk, chunk_id),
-                        timeout=self.request_timeout * 1.5,
-                    )
-                except asyncio.TimeoutError:
-                    logger.error(f"Timeout in processing chunk {chunk_id}")
-                    self._save_error_file(chunk_id, "Processing timeout")
-                except Exception as e:
-                    logger.error(f"Error in processing chunk {chunk_id}: {str(e)}")
-                    self._save_error_file(chunk_id, str(e))
-                finally:
-                    # Restore the original output directory
-                    self.output_dir = original_output_dir
-
-        session = await self.create_session()  # Await the coroutine to get the session
-        async with session:  # Now use the session in an async context manager
-            chunk_id = 0
-            tasks = []
-
-            # Process up to self.max_concurrent_requests chunks at a time
-            batch_size = self.max_concurrent_requests
-
-            while not self.chunk_queue.empty():
-                current_batch = []
-
-                # Create a batch of tasks
-                for _ in range(min(batch_size, self.chunk_queue.qsize())):
-                    if self.chunk_queue.empty():
-                        break
-
-                    chunk, output_dir = self.chunk_queue.get()
-                    task = asyncio.create_task(
-                        process_with_semaphore(session, chunk, chunk_id, output_dir)
-                    )
-                    current_batch.append(task)
-                    chunk_id += 1
-
-                if current_batch:
-                    # Wait for the current batch to complete before starting the next batch
-                    await asyncio.gather(*current_batch, return_exceptions=True)
-
-                    # Small delay between batches to let the system recover
-                    await asyncio.sleep(1)
-
-            # Wait for any remaining tasks
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+            return [], ""
 
     async def run(self) -> None:
         """
-        Main execution method with improved error handling and per-file processing.
+        Main execution method with improved parallel processing.
         """
         input_files = glob.glob(os.path.join(self.input_dir, "*.txt"))
         if not input_files:
             logger.warning(f"No .txt files found in {self.input_dir}")
             return
 
-        # Process each file separately to avoid memory issues
-        for file_path in input_files:
-            try:
-                logger.info(f"Starting processing for file: {file_path}")
-                self.process_file(file_path)
+        # Initialize the semaphore for API request limiting
+        self.api_semaphore = asyncio.Semaphore(self.max_concurrent_requests)
 
-                # Get filename without extension for the output directory
-                base_filename = os.path.splitext(os.path.basename(file_path))[0]
-                file_output_dir = os.path.join(self.output_dir, base_filename)
+        # Create a session for all requests
+        session = await self.create_session()
 
-                # Process chunks for this file
-                await self.process_chunks_with_semaphore(file_output_dir)
+        async with session:
+            # Start worker tasks for parallel processing
+            workers = []
+            for _ in range(self.max_concurrent_requests):
+                worker = asyncio.create_task(self.process_pipeline(session))
+                workers.append(worker)
 
-                logger.info(f"Completed processing file: {file_path}")
+            # Process each file
+            for file_path in input_files:
+                try:
+                    logger.info(f"Starting processing for file: {file_path}")
+                    chunks, file_output_dir = self.process_file(file_path)
 
-                # Small delay between files to let the system recover
-                await asyncio.sleep(2)
+                    if not chunks or not file_output_dir:
+                        logger.warning(
+                            f"Skipping file {file_path} due to processing errors"
+                        )
+                        continue
 
-            except Exception as e:
-                logger.error(f"Failed to process file {file_path}: {str(e)}")
+                    # Add all chunks to the processing queue
+                    for chunk_id, chunk in enumerate(chunks):
+                        await self.processing_queue.put(
+                            (chunk, chunk_id, file_output_dir)
+                        )
+
+                    logger.info(
+                        f"Added {len(chunks)} chunks from {file_path} to processing queue"
+                    )
+
+                except Exception as e:
+                    logger.error(f"Failed to process file {file_path}: {str(e)}")
+
+            # Wait for all tasks in the queue to be processed
+            await self.processing_queue.join()
+
+            # Send stop signals to all workers
+            for _ in range(len(workers)):
+                await self.processing_queue.put(None)
+
+            # Wait for all workers to finish
+            await asyncio.gather(*workers, return_exceptions=True)
 
         logger.info("All processing complete!")
 
@@ -639,7 +688,7 @@ class OpenWebUIProcessor:
             # Fallback to character-based estimation
             return len(text) // 4
 
-    def chunk_text(self, text, max_tokens=4000):
+    def chunk_text(self, text, max_tokens=6000):
         """
         Split text into smaller chunks, optimized for stability.
         """
